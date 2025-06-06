@@ -7,6 +7,7 @@ package com.wireguard.android.backend;
 
 import android.content.Context;
 import android.content.Intent;
+import android.net.VpnService.Builder;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.system.OsConstants;
@@ -24,7 +25,6 @@ import com.wireguard.crypto.KeyFormatException;
 import com.wireguard.util.NonNullForAll;
 
 import java.net.InetAddress;
-import java.time.Instant;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -37,6 +37,11 @@ import androidx.annotation.Nullable;
 import androidx.collection.ArraySet;
 
 /**
+ * Changed by Mykal Cuin on behalf of Todyl to include a function to pass in an outside built
+ * VPN Android Builder, and not to create a new one if it was passed in.
+ */
+
+/**
  * Implementation of {@link Backend} that uses the wireguard-go userspace implementation to provide
  * WireGuard tunnels.
  */
@@ -45,11 +50,15 @@ public final class GoBackend implements Backend {
     private static final int DNS_RESOLUTION_RETRIES = 10;
     private static final String TAG = "WireGuard/GoBackend";
     @Nullable private static AlwaysOnCallback alwaysOnCallback;
-    private static GhettoCompletableFuture<VpnService> vpnService = new GhettoCompletableFuture<>();
+    public static GhettoCompletableFuture<VpnService> vpnService = new GhettoCompletableFuture<>();
     private final Context context;
     @Nullable private Config currentConfig;
     @Nullable private Tunnel currentTunnel;
     private int currentTunnelHandle = -1;
+
+    //A holder for an external Android VPNService Builder
+    @Nullable
+    private Builder vpnBuilder;
 
     /**
      * Public constructor for GoBackend.
@@ -224,6 +233,20 @@ public final class GoBackend implements Backend {
         return getState(tunnel);
     }
 
+    /**
+     * Allows a user to pass in an app side made VPNService. Allows for excluded routes functionality in API 33+.
+     *
+     * @param vpnBuilder The passed Builder for the VPNService made outside the library.
+     * @param tunnel The tunnel to change state on, passed for setState.
+     * @param state The new state for this tunnel, passed for setState. Must be {@code UP}, {@code DOWN}, or {@code TOGGLE}.
+     * @param config The configuration for this tunnel, may be null if state is {@code DOWN}, passed for setState.
+     * @throws Exception Exception raised while changing tunnel state, needed for setState.
+     */
+    public void setVpnBuilder(final Builder vpnBuilder, final Tunnel tunnel, State state, @Nullable final Config config) throws Exception {
+        this.vpnBuilder = vpnBuilder;
+        setState(tunnel, state, config);
+    }
+
     private void setStateInternal(final Tunnel tunnel, @Nullable final Config config, final State state)
             throws Exception {
         Log.i(TAG, "Bringing tunnel " + tunnel.getName() + ' ' + state);
@@ -277,49 +300,52 @@ public final class GoBackend implements Backend {
             // Build config
             final String goConfig = config.toWgUserspaceString();
 
-            // Create the vpn tunnel with android API
-            final VpnService.Builder builder = service.getBuilder();
-            builder.setSession(tunnel.getName());
+            if (vpnBuilder == null) {
+                // Create the vpn tunnel with android API
+                vpnBuilder = service.getBuilder();
 
-            for (final String excludedApplication : config.getInterface().getExcludedApplications())
-                builder.addDisallowedApplication(excludedApplication);
+                for (final String excludedApplication : config.getInterface().getExcludedApplications())
+                    vpnBuilder.addDisallowedApplication(excludedApplication);
 
-            for (final String includedApplication : config.getInterface().getIncludedApplications())
-                builder.addAllowedApplication(includedApplication);
+                for (final String includedApplication : config.getInterface().getIncludedApplications())
+                    vpnBuilder.addAllowedApplication(includedApplication);
 
-            for (final InetNetwork addr : config.getInterface().getAddresses())
-                builder.addAddress(addr.getAddress(), addr.getMask());
+                for (final InetNetwork addr : config.getInterface().getAddresses())
+                    vpnBuilder.addAddress(addr.getAddress(), addr.getMask());
 
-            for (final InetAddress addr : config.getInterface().getDnsServers())
-                builder.addDnsServer(addr.getHostAddress());
+                for (final InetAddress addr : config.getInterface().getDnsServers())
+                    vpnBuilder.addDnsServer(addr.getHostAddress());
 
-            for (final String dnsSearchDomain : config.getInterface().getDnsSearchDomains())
-                builder.addSearchDomain(dnsSearchDomain);
+                for (final String dnsSearchDomain : config.getInterface().getDnsSearchDomains())
+                    vpnBuilder.addSearchDomain(dnsSearchDomain);
 
-            boolean sawDefaultRoute = false;
-            for (final Peer peer : config.getPeers()) {
-                for (final InetNetwork addr : peer.getAllowedIps()) {
-                    if (addr.getMask() == 0)
-                        sawDefaultRoute = true;
-                    builder.addRoute(addr.getAddress(), addr.getMask());
+                boolean sawDefaultRoute = false;
+                for (final Peer peer : config.getPeers()) {
+                    for (final InetNetwork addr : peer.getAllowedIps()) {
+                        if (addr.getMask() == 0)
+                            sawDefaultRoute = true;
+                        vpnBuilder.addRoute(addr.getAddress(), addr.getMask());
+                    }
                 }
+
+                // "Kill-switch" semantics
+                if (!(sawDefaultRoute && config.getPeers().size() == 1)) {
+                    vpnBuilder.allowFamily(OsConstants.AF_INET);
+                    vpnBuilder.allowFamily(OsConstants.AF_INET6);
+                }
+
+                vpnBuilder.setMtu(config.getInterface().getMtu().orElse(1280));
             }
 
-            // "Kill-switch" semantics
-            if (!(sawDefaultRoute && config.getPeers().size() == 1)) {
-                builder.allowFamily(OsConstants.AF_INET);
-                builder.allowFamily(OsConstants.AF_INET6);
-            }
-
-            builder.setMtu(config.getInterface().getMtu().orElse(1280));
+            vpnBuilder.setSession(tunnel.getName());
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                builder.setMetered(false);
+                vpnBuilder.setMetered(false);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
                 service.setUnderlyingNetworks(null);
 
-            builder.setBlocking(true);
-            try (final ParcelFileDescriptor tun = builder.establish()) {
+            vpnBuilder.setBlocking(true);
+            try (final ParcelFileDescriptor tun = vpnBuilder.establish()) {
                 if (tun == null)
                     throw new BackendException(Reason.TUN_CREATION_ERROR);
                 Log.d(TAG, "Go backend " + wgVersion());
